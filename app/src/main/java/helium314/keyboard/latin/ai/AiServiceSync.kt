@@ -353,21 +353,108 @@ object AiServiceSync {
 
     @JvmField
     val CLOUD_MODELS: List<Pair<String, String>> = listOf(
-        "Gemini 2.5 Flash" to "gemini:gemini-2.5-flash",
         "Claude Sonnet 4.5 (Anthropic)" to "anthropic:claude-sonnet-4-5",
         "Claude Opus 4.1 (Anthropic)" to "anthropic:claude-opus-4-1",
         "Claude Haiku 4.5 (Anthropic)" to "anthropic:claude-haiku-4-5",
-        "GPT-4o (OpenAI)" to "openai-cloud:gpt-4o",
-        "GPT-4o mini (OpenAI)" to "openai-cloud:gpt-4o-mini",
-        "GPT-4.1 (OpenAI)" to "openai-cloud:gpt-4.1",
-        "Llama 4 Scout (Groq)" to "groq:meta-llama/llama-4-scout-17b-16e-instruct",
-        "Llama 3.3 70B (Groq)" to "groq:llama-3.3-70b-versatile",
-        "Gemma 2 9B (Groq)" to "groq:gemma2-9b-it",
         "Gemma 4 26B (OpenRouter)" to "openrouter:google/gemma-4-26b-a4b-it:free",
         "Gemma 3 27B (OpenRouter)" to "openrouter:google/gemma-3-27b-it:free",
         "Llama 3.3 70B (OpenRouter)" to "openrouter:meta-llama/llama-3.3-70b-instruct:free",
         "Qwen3 Coder (OpenRouter)" to "openrouter:qwen/qwen3-coder:free",
     )
+
+    private val dynamicCloudProviders = mapOf(
+        "gemini" to (Settings.PREF_GEMINI_API_KEY to "ai_cloud_models_gemini"),
+        "groq" to (Settings.PREF_GROQ_API_KEY to "ai_cloud_models_groq"),
+        "openai-cloud" to (Settings.PREF_OPENAI_API_KEY to "ai_cloud_models_openai")
+    )
+
+    private fun cloudModelsPreference(provider: String): String? =
+        dynamicCloudProviders[provider]?.second
+
+    @JvmStatic
+    fun clearCloudModels(prefs: SharedPreferences, provider: String) {
+        cloudModelsPreference(provider)?.let { prefs.edit().remove(it).apply() }
+    }
+
+    @JvmStatic
+    fun fetchCloudModels(provider: String): List<Pair<String, String>> {
+        val (keyPreference, _) = dynamicCloudProviders[provider]
+            ?: throw IllegalArgumentException("Unsupported cloud model provider")
+        val apiKey = SecureApiKeys.getKey(keyPreference)
+        if (apiKey.isBlank()) return emptyList()
+
+        val url = when (provider) {
+            "gemini" -> URL("https://generativelanguage.googleapis.com/v1beta/models")
+            "groq" -> URL("https://api.groq.com/openai/v1/models")
+            else -> URL("https://api.openai.com/v1/models")
+        }
+        val conn = url.openConnection() as HttpURLConnection
+        conn.connectTimeout = 5000
+        conn.readTimeout = 10000
+        when (provider) {
+            "gemini" -> conn.setRequestProperty("x-goog-api-key", apiKey)
+            else -> conn.setRequestProperty("Authorization", "Bearer " + apiKey)
+        }
+        try {
+            if (conn.responseCode !in 200..299) {
+                throw java.io.IOException("Model request failed (${conn.responseCode})")
+            }
+            val json = JSONObject(readBounded(conn.inputStream))
+            val models = when (provider) {
+                "gemini" -> {
+                    val data = json.optJSONArray("models") ?: return emptyList()
+                    (0 until data.length()).mapNotNull { index ->
+                        val item = data.optJSONObject(index) ?: return@mapNotNull null
+                        val id = item.optString("name").removePrefix("models/")
+                        val methods = item.optJSONArray("supportedGenerationMethods")
+                        if (id.isBlank() || methods == null ||
+                            (0 until methods.length()).none { methods.optString(it) == "generateContent" }
+                        ) return@mapNotNull null
+                        val name = item.optString("displayName").ifBlank { id }
+                        "$name (Gemini)" to "gemini:$id"
+                    }
+                }
+                else -> {
+                    val data = json.optJSONArray("data") ?: return emptyList()
+                    (0 until data.length()).mapNotNull { index ->
+                        val id = data.optJSONObject(index)?.optString("id")?.takeIf(String::isNotBlank)
+                            ?: return@mapNotNull null
+                        val name = if (provider == "groq") "Groq" else "OpenAI"
+                        "$id ($name)" to "$provider:$id"
+                    }
+                }
+            }
+            return models.distinctBy { it.second }.sortedBy { it.first.lowercase() }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    @JvmStatic
+    fun cacheCloudModels(prefs: SharedPreferences, provider: String, models: List<Pair<String, String>>) {
+        val preference = cloudModelsPreference(provider) ?: return
+        val json = JSONArray()
+        models.forEach { (name, value) ->
+            json.put(JSONObject().put("name", name).put("value", value))
+        }
+        prefs.edit().putString(preference, json.toString()).apply()
+    }
+
+    private fun cachedCloudModels(prefs: SharedPreferences, provider: String): List<Pair<String, String>> {
+        val (keyPreference, preference) = dynamicCloudProviders[provider] ?: return emptyList()
+        if (SecureApiKeys.getKey(keyPreference).isBlank()) return emptyList()
+        return try {
+            val json = JSONArray(prefs.getString(preference, "[]"))
+            (0 until json.length()).mapNotNull { index ->
+                val item = json.optJSONObject(index) ?: return@mapNotNull null
+                val name = item.optString("name")
+                val value = item.optString("value")
+                if (name.isBlank() || value.isBlank()) null else name to value
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
 
     /**
      * Parse user-defined custom OpenRouter model IDs from [Settings.PREF_OPENROUTER_CUSTOM_MODELS].
@@ -392,7 +479,8 @@ object AiServiceSync {
     /** Built-in CLOUD_MODELS plus any user-defined custom OpenRouter models. */
     @JvmStatic
     fun cloudModelsWithCustom(prefs: SharedPreferences): List<Pair<String, String>> =
-        CLOUD_MODELS + getCustomOpenRouterModels(prefs)
+        dynamicCloudProviders.keys.flatMap { cachedCloudModels(prefs, it) } +
+            CLOUD_MODELS + getCustomOpenRouterModels(prefs)
 
     /**
      * Check if a cloud model has the required API key configured.

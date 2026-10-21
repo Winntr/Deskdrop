@@ -240,7 +240,8 @@ private fun EditableSecretField(
     placeholder: String = "Tap to enter your API key…",
     dialogDescription: String? = null,
     testUrl: String? = null,
-    testAuthStyle: ApiAuthStyle = ApiAuthStyle.BEARER
+    testAuthStyle: ApiAuthStyle = ApiAuthStyle.BEARER,
+    onSaved: (() -> Unit)? = null
 ) {
     var showDialog by remember { mutableStateOf(false) }
     var current by remember { mutableStateOf(helium314.keyboard.latin.ai.SecureApiKeys.getKey(secretKey)) }
@@ -313,6 +314,7 @@ private fun EditableSecretField(
                 helium314.keyboard.latin.ai.SecureApiKeys.setKey(secretKey, trimmed)
                 current = trimmed
                 testStatus = null
+                onSaved?.invoke()
                 helium314.keyboard.keyboard.KeyboardSwitcher.getInstance().setThemeNeedsReload()
             },
             initialText = current,
@@ -1669,6 +1671,44 @@ private fun CloudTab(
     val isCloud = !currentModel.startsWith("ollama:") && !currentModel.startsWith("onnx:") && !currentModel.startsWith("openai:")
 
     val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var cloudModelsRefreshing by remember { mutableStateOf(false) }
+    var cloudModelsStatus by remember { mutableStateOf("") }
+    fun refreshCloudModels(providers: List<String>, clearProvider: String? = null) {
+        if (clearProvider != null) AiServiceSync.clearCloudModels(prefs, clearProvider)
+        val configuredProviders = providers.filter { provider ->
+            val keyPreference = when (provider) {
+                "groq" -> Settings.PREF_GROQ_API_KEY
+                "gemini" -> Settings.PREF_GEMINI_API_KEY
+                else -> Settings.PREF_OPENAI_API_KEY
+            }
+            helium314.keyboard.latin.ai.SecureApiKeys.getKey(keyPreference).isNotBlank()
+        }
+        if (configuredProviders.isEmpty()) {
+            cloudModelsStatus = "Enter an API key to load models"
+            return
+        }
+        cloudModelsRefreshing = true
+        cloudModelsStatus = "Loading models…"
+        scope.launch {
+            val results = withContext(Dispatchers.IO) {
+                configuredProviders.map { provider ->
+                    try {
+                        val models = AiServiceSync.fetchCloudModels(provider)
+                        AiServiceSync.cacheCloudModels(prefs, provider, models)
+                        "$provider: ${models.size}"
+                    } catch (_: Exception) {
+                        "$provider: unavailable"
+                    }
+                }
+            }
+            cloudModelsRefreshing = false
+            cloudModelsStatus = results.joinToString(" · ")
+        }
+    }
+    LaunchedEffect(Unit) {
+        refreshCloudModels(listOf("groq", "gemini", "openai-cloud"))
+    }
     var cloudAdvancedExpanded by rememberSaveable { mutableStateOf(false) }
 
     Column(Modifier.verticalScroll(rememberScrollState()).padding(bottom = 48.dp)) {
@@ -1689,6 +1729,31 @@ private fun CloudTab(
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)
         )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedButton(
+                onClick = { refreshCloudModels(listOf("groq", "gemini", "openai-cloud")) },
+                enabled = !cloudModelsRefreshing
+            ) {
+                if (cloudModelsRefreshing) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.size(8.dp))
+                }
+                Text("Refresh cloud models")
+            }
+            if (cloudModelsStatus.isNotBlank()) {
+                Text(
+                    cloudModelsStatus,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 8.dp)
+                )
+            }
+        }
 
         // Default cloud model picker
         var showModelDialog by remember { mutableStateOf(false) }
@@ -1736,7 +1801,8 @@ private fun CloudTab(
             secretKey = Settings.PREF_GROQ_API_KEY,
             label = stringResource(R.string.groq_api_key),
             placeholder = "Paste your API key",
-            testUrl = "https://api.groq.com/openai/v1/models"
+            testUrl = "https://api.groq.com/openai/v1/models",
+            onSaved = { refreshCloudModels(listOf("groq"), "groq") }
         )
         Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)) {
             Text(
@@ -1762,7 +1828,8 @@ private fun CloudTab(
             label = stringResource(R.string.gemini_api_key),
             placeholder = "Paste your API key",
             testUrl = "https://generativelanguage.googleapis.com/v1beta/models?key=",
-            testAuthStyle = ApiAuthStyle.QUERY_PARAM
+            testAuthStyle = ApiAuthStyle.QUERY_PARAM,
+            onSaved = { refreshCloudModels(listOf("gemini"), "gemini") }
         )
         Row(modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)) {
             Spacer(Modifier.weight(1f))
@@ -1851,7 +1918,8 @@ private fun CloudTab(
                     secretKey = Settings.PREF_OPENAI_API_KEY,
                     label = stringResource(R.string.openai_api_key),
                     placeholder = "Paste your API key",
-                    testUrl = "https://api.openai.com/v1/models"
+                    testUrl = "https://api.openai.com/v1/models",
+                    onSaved = { refreshCloudModels(listOf("openai-cloud"), "openai-cloud") }
                 )
 
                 // Search providers

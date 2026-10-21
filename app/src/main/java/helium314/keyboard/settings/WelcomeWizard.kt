@@ -91,17 +91,6 @@ import kotlinx.coroutines.withContext
 
 private val DeskdropTeal = Color(0xFF2D8B7A)
 
-private val wizardCloudModels = listOf(
-    "Llama 4 Scout (Groq)" to "groq:meta-llama/llama-4-scout-17b-16e-instruct",
-    "Gemini 2.5 Flash" to "gemini:gemini-2.5-flash",
-    "Llama 3.3 70B (Groq)" to "groq:llama-3.3-70b-versatile",
-    "Gemma 2 9B (Groq)" to "groq:gemma2-9b-it",
-    "Gemma 3 27B (OpenRouter)" to "openrouter:google/gemma-3-27b-it:free",
-    "Llama 4 Scout (OpenRouter)" to "openrouter:meta-llama/llama-4-scout:free",
-    "Mistral Small 24B (OpenRouter)" to "openrouter:mistralai/mistral-small-3.1-24b-instruct:free",
-    "Qwen3 30B (OpenRouter)" to "openrouter:qwen/qwen3-30b-a3b:free",
-)
-
 private sealed class OllamaStatus {
     data object Idle : OllamaStatus()
     data object Connecting : OllamaStatus()
@@ -165,7 +154,22 @@ fun WelcomeWizard(
     var ollamaStatus by remember { mutableStateOf<OllamaStatus>(OllamaStatus.Idle) }
     val ollamaModels = remember { mutableStateListOf<String>() }
     var selectedOllamaModel by rememberSaveable { mutableStateOf("") }
-    var selectedCloudModel by rememberSaveable { mutableStateOf(wizardCloudModels.first().second) }
+    val wizardCloudModels = remember {
+        mutableStateListOf<Pair<String, String>>().apply {
+            addAll(AiServiceSync.cloudModelsWithCustom(prefs).filter { AiServiceSync.hasApiKey(it.second) })
+        }
+    }
+    var selectedCloudModel by rememberSaveable {
+        mutableStateOf(
+            wizardCloudModels.firstOrNull()?.second
+                ?: prefs.getString(
+                    helium314.keyboard.latin.settings.Settings.PREF_AI_MODEL,
+                    Defaults.PREF_AI_MODEL
+                )
+                ?: Defaults.PREF_AI_MODEL
+        )
+    }
+    var cloudModelFetchStatus by remember { mutableStateOf("") }
     var apiKey by rememberSaveable { mutableStateOf("") }
     var groqApiKey by rememberSaveable { mutableStateOf("") }
     var geminiApiKey by rememberSaveable { mutableStateOf("") }
@@ -209,6 +213,38 @@ fun WelcomeWizard(
     var showOpenAiCompatFallbackUrlDialog by rememberSaveable { mutableStateOf(false) }
     var showOpenAiCompatKeyDialog by rememberSaveable { mutableStateOf(false) }
 
+    fun refreshWizardCloudModels(provider: String, apiKey: String) {
+        wizardCloudModels.removeAll { it.second.startsWith("$provider:") }
+        if (apiKey.isBlank()) return
+        cloudModelFetchStatus = "Loading $provider models…"
+        scope.launch {
+            try {
+                val models = withContext(Dispatchers.IO) {
+                    AiServiceSync.fetchCloudModels(provider, apiKey)
+                }
+                AiServiceSync.cacheCloudModels(prefs, provider, models)
+                wizardCloudModels.addAll(models)
+                cloudModelFetchStatus = "${models.size} $provider models available"
+                if (selectedCloudModel.substringBefore(":") == provider && models.isNotEmpty()) {
+                    selectedCloudModel = models.first().second
+                }
+            } catch (_: Exception) {
+                cloudModelFetchStatus = "Could not load $provider models"
+            }
+        }
+    }
+
+    fun selectedWizardCloudModel(): String =
+        wizardCloudModels.firstOrNull { it.second == selectedCloudModel }?.second
+            ?: when {
+                groqApiKey.isNotBlank() ->
+                    wizardCloudModels.firstOrNull { it.second.startsWith("groq:") }?.second
+                geminiApiKey.isNotBlank() ->
+                    wizardCloudModels.firstOrNull { it.second.startsWith("gemini:") }?.second
+                else -> wizardCloudModels.firstOrNull()?.second
+            }
+            ?: Defaults.PREF_AI_MODEL
+
     fun saveAiAndClose() {
         val editor = prefs.edit()
         editor.putBoolean(helium314.keyboard.latin.settings.Settings.PREF_DESKDROP_SETUP_V2, true)
@@ -245,12 +281,7 @@ fun WelcomeWizard(
             if (geminiApiKey.isNotBlank()) {
                 helium314.keyboard.latin.ai.SecureApiKeys.setKey(helium314.keyboard.latin.settings.Settings.PREF_GEMINI_API_KEY, geminiApiKey)
             }
-            // Auto-select model: prefer Groq (faster), fall back to Gemini
-            val autoModel = when {
-                groqApiKey.isNotBlank() -> "groq:meta-llama/llama-4-scout-17b-16e-instruct"
-                geminiApiKey.isNotBlank() -> "gemini:gemini-2.5-flash"
-                else -> selectedCloudModel
-            }
+            val autoModel = selectedWizardCloudModel()
             editor.putString(helium314.keyboard.latin.settings.Settings.PREF_AI_MODEL, autoModel)
             editor.putString(helium314.keyboard.latin.settings.Settings.PREF_AI_INLINE_MODEL, autoModel)
             editor.putString(helium314.keyboard.latin.settings.Settings.PREF_AI_CONVERSATION_MODEL, autoModel)
@@ -709,6 +740,21 @@ fun WelcomeWizard(
                             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
                             modifier = Modifier.padding(top = 4.dp)
                         )
+                        Spacer(Modifier.height(16.dp))
+                        SettingRow(
+                            "Cloud model",
+                            wizardCloudModels.firstOrNull { it.second == selectedCloudModel }?.first
+                                ?: "(enter an API key to load models)"
+                        ) {
+                            if (wizardCloudModels.isNotEmpty()) showModelDialog = true
+                        }
+                        if (cloudModelFetchStatus.isNotBlank()) {
+                            Text(
+                                cloudModelFetchStatus,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                            )
+                        }
 
                         Spacer(Modifier.height(12.dp))
                         Text(
@@ -721,7 +767,8 @@ fun WelcomeWizard(
                         Button(
                             onClick = { step = 8 },
                             Modifier.fillMaxWidth(),
-                            enabled = groqApiKey.isNotBlank() || geminiApiKey.isNotBlank(),
+                            enabled = (groqApiKey.isNotBlank() || geminiApiKey.isNotBlank()) &&
+                                !cloudModelFetchStatus.startsWith("Loading"),
                             colors = ButtonDefaults.buttonColors(containerColor = DeskdropTeal)
                         ) { Text("Continue") }
                         Spacer(Modifier.height(8.dp))
@@ -730,7 +777,11 @@ fun WelcomeWizard(
                         if (showGroqKeyDialog) {
                             TextInputDialog(
                                 onDismissRequest = { showGroqKeyDialog = false },
-                                onConfirmed = { groqApiKey = it; showGroqKeyDialog = false },
+                                onConfirmed = {
+                                    groqApiKey = it
+                                    refreshWizardCloudModels("groq", it)
+                                    showGroqKeyDialog = false
+                                },
                                 initialText = groqApiKey,
                                 title = { Text("Groq API Key") },
                                 checkTextValid = { it.isNotBlank() },
@@ -739,7 +790,11 @@ fun WelcomeWizard(
                         if (showGeminiKeyDialog) {
                             TextInputDialog(
                                 onDismissRequest = { showGeminiKeyDialog = false },
-                                onConfirmed = { geminiApiKey = it; showGeminiKeyDialog = false },
+                                onConfirmed = {
+                                    geminiApiKey = it
+                                    refreshWizardCloudModels("gemini", it)
+                                    showGeminiKeyDialog = false
+                                },
                                 initialText = geminiApiKey,
                                 title = { Text("Gemini API Key") },
                                 checkTextValid = { it.isNotBlank() },
@@ -794,12 +849,9 @@ fun WelcomeWizard(
                         Text("See how AI improves your text",
                             style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f))
                         Spacer(Modifier.height(16.dp))
+                        val selectedCloud = selectedWizardCloudModel()
                         val providerLabel = if (selectedMode == "local") "Ollama ($selectedOllamaModel)"
-                        else when {
-                            groqApiKey.isNotBlank() -> "Groq (cloud)"
-                            geminiApiKey.isNotBlank() -> "Gemini (cloud)"
-                            else -> wizardCloudModels.firstOrNull { it.second == selectedCloudModel }?.first ?: selectedCloudModel
-                        }
+                        else wizardCloudModels.firstOrNull { it.second == selectedCloud }?.first ?: selectedCloud
                         Text("AI powered by $providerLabel",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f))
                         Spacer(Modifier.height(20.dp))
@@ -825,11 +877,7 @@ fun WelcomeWizard(
                                     editor.putString(helium314.keyboard.latin.settings.Settings.PREF_AI_MODEL, "ollama:$selectedOllamaModel")
                                     editor.putString(helium314.keyboard.latin.settings.Settings.PREF_OLLAMA_URL, helium314.keyboard.latin.ai.AiServiceSync.normalizeOllamaUrl(ollamaUrl))
                                 } else if (selectedMode == "cloud") {
-                                    val autoModel = when {
-                                        groqApiKey.isNotBlank() -> "groq:meta-llama/llama-4-scout-17b-16e-instruct"
-                                        geminiApiKey.isNotBlank() -> "gemini:gemini-2.5-flash"
-                                        else -> selectedCloudModel
-                                    }
+                                    val autoModel = selectedWizardCloudModel()
                                     editor.putString(helium314.keyboard.latin.settings.Settings.PREF_AI_MODEL, autoModel)
                                     if (groqApiKey.isNotBlank()) helium314.keyboard.latin.ai.SecureApiKeys.setKey(helium314.keyboard.latin.settings.Settings.PREF_GROQ_API_KEY, groqApiKey)
                                     if (geminiApiKey.isNotBlank()) helium314.keyboard.latin.ai.SecureApiKeys.setKey(helium314.keyboard.latin.settings.Settings.PREF_GEMINI_API_KEY, geminiApiKey)

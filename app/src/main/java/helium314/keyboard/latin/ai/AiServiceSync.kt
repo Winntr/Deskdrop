@@ -380,7 +380,12 @@ object AiServiceSync {
     fun fetchCloudModels(provider: String): List<Pair<String, String>> {
         val (keyPreference, _) = dynamicCloudProviders[provider]
             ?: throw IllegalArgumentException("Unsupported cloud model provider")
-        val apiKey = SecureApiKeys.getKey(keyPreference)
+        return fetchCloudModels(provider, SecureApiKeys.getKey(keyPreference))
+    }
+
+    @JvmStatic
+    fun fetchCloudModels(provider: String, apiKey: String): List<Pair<String, String>> {
+        if (provider !in dynamicCloudProviders) throw IllegalArgumentException("Unsupported cloud model provider")
         if (apiKey.isBlank()) return emptyList()
 
         val url = when (provider) {
